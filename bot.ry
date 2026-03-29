@@ -1,0 +1,183 @@
+import asyncio
+import logging
+import aiosqlite
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+import os
+
+TOKEN = os.getenv("TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
+
+logging.basicConfig(level=logging.INFO)
+
+# --- БАЗА ---
+async def init_db():
+    async with aiosqlite.connect("db.sqlite3") as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            admin_msg_id INTEGER,
+            user_id INTEGER
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS blocked (
+            user_id INTEGER
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS stats (
+            user_id INTEGER,
+            count INTEGER
+        )
+        """)
+        await db.commit()
+
+# --- СТАТИСТИКА ---
+async def add_stat(user_id):
+    async with aiosqlite.connect("db.sqlite3") as db:
+        async with db.execute("SELECT count FROM stats WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+
+        if row:
+            await db.execute("UPDATE stats SET count=count+1 WHERE user_id=?", (user_id,))
+        else:
+            await db.execute("INSERT INTO stats VALUES (?, 1)", (user_id,))
+        await db.commit()
+
+async def get_top():
+    async with aiosqlite.connect("db.sqlite3") as db:
+        async with db.execute("SELECT user_id, count FROM stats ORDER BY count DESC LIMIT 5") as cur:
+            return await cur.fetchall()
+
+# --- БАН ---
+async def is_blocked(user_id):
+    async with aiosqlite.connect("db.sqlite3") as db:
+        async with db.execute("SELECT 1 FROM blocked WHERE user_id=?", (user_id,)) as cur:
+            return await cur.fetchone() is not None
+
+# --- СОХРАНЕНИЕ ---
+async def save_message(admin_msg_id, user_id):
+    async with aiosqlite.connect("db.sqlite3") as db:
+        await db.execute("INSERT INTO messages VALUES (?, ?)", (admin_msg_id, user_id))
+        await db.commit()
+
+# --- СТАРТ ---
+@dp.message_handler(commands=['start'])
+async def start(msg: types.Message):
+    await msg.answer(
+        "💌 <b>Анонимные сообщения</b>\n\n"
+        "Отправь текст, фото или видео.\n"
+        "Я получу это анонимно 👀",
+        parse_mode="HTML"
+    )
+
+# --- ПОЛЬЗОВАТЕЛЬ ---
+@dp.message_handler(content_types=types.ContentTypes.ANY)
+async def user_message(msg: types.Message):
+    if msg.from_user.id == ADMIN_ID:
+        return
+
+    if await is_blocked(msg.from_user.id):
+        return await msg.answer("⛔ Ты заблокирован")
+
+    await add_stat(msg.from_user.id)
+
+    keyboard = InlineKeyboardMarkup().add(
+        InlineKeyboardButton("✉️ Ответить", callback_data=f"reply_{msg.from_user.id}"),
+        InlineKeyboardButton("👤 Кто это?", callback_data=f"who_{msg.from_user.id}"),
+        InlineKeyboardButton("🚫 Блок", callback_data=f"block_{msg.from_user.id}")
+    )
+
+    if msg.text:
+        sent = await bot.send_message(
+            ADMIN_ID,
+            f"💌 <b>Новое сообщение</b>\n\n{msg.text}",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+
+    elif msg.photo:
+        sent = await bot.send_photo(
+            ADMIN_ID,
+            msg.photo[-1].file_id,
+            caption=f"💌 Фото\n{msg.caption or ''}",
+            reply_markup=keyboard
+        )
+
+    elif msg.video:
+        sent = await bot.send_video(
+            ADMIN_ID,
+            msg.video.file_id,
+            caption=f"💌 Видео\n{msg.caption or ''}",
+            reply_markup=keyboard
+        )
+
+    else:
+        sent = await bot.send_message(ADMIN_ID, "💌 Файл", reply_markup=keyboard)
+
+    await save_message(sent.message_id, msg.from_user.id)
+
+# --- КНОПКИ ---
+@dp.callback_query_handler(lambda c: True)
+async def callbacks(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    action, user_id = call.data.split("_")
+    user_id = int(user_id)
+
+    if action == "who":
+        await call.answer(f"ID: {user_id}", show_alert=True)
+
+    elif action == "block":
+        async with aiosqlite.connect("db.sqlite3") as db:
+            await db.execute("INSERT INTO blocked VALUES (?)", (user_id,))
+            await db.commit()
+        await call.answer("🚫 Заблокирован", show_alert=True)
+
+    elif action == "reply":
+        await call.message.answer("✏️ Напиши ответ:")
+        dp.current_state(user=call.from_user.id).set_state(f"reply_{user_id}")
+
+# --- ОТВЕТ ---
+@dp.message_handler(lambda msg: msg.from_user.id == ADMIN_ID)
+async def admin_reply(msg: types.Message):
+    state = dp.current_state(user=msg.from_user.id)
+    data = await state.get_state()
+
+    if data and data.startswith("reply_"):
+        user_id = int(data.split("_")[1])
+
+        if msg.text:
+            await bot.send_message(user_id, f"💬 <b>Ответ:</b>\n\n{msg.text}", parse_mode="HTML")
+        elif msg.photo:
+            await bot.send_photo(user_id, msg.photo[-1].file_id, caption="💬 Ответ")
+        elif msg.video:
+            await bot.send_video(user_id, msg.video.file_id, caption="💬 Ответ")
+
+        await msg.answer("✅ Отправлено")
+        await state.finish()
+
+# --- СТАТИСТИКА КОМАНДА ---
+@dp.message_handler(commands=['stats'])
+async def stats(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    top = await get_top()
+
+    text = "📊 <b>Топ анонимов:</b>\n\n"
+    for i, (user_id, count) in enumerate(top, 1):
+        text += f"{i}. ID {user_id} — {count} сообщений\n"
+
+    await msg.answer(text, parse_mode="HTML")
+
+# --- ЗАПУСК ---
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db())
+    executor.start_polling(dp)
